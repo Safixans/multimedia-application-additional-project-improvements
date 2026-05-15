@@ -31,11 +31,19 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
             gene_list_path=os.path.join(args.source_dataroot, args.dataset, args.gene_list),
         ) for sample_id in train_sample_ids
     ]
-    train_dataset = MultiHESTDataset(sample_id_paths, 
-                                     distribution=args.patch_distribution, 
+    train_dataset = MultiHESTDataset(sample_id_paths,
+                                     distribution=args.patch_distribution,
                                      normalize_method=normalize_method,
                                      sample_times=args.sample_times)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=padding_batcher())
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        collate_fn=padding_batcher(),
+        num_workers=args.num_workers,
+        pin_memory=args.num_workers > 0 and torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+    )
 
     # using the same train sample ids for validation
     sample_id_paths = [
@@ -61,8 +69,12 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
     device = args.device
     model = Denoiser(args).to(device)
 
+    # Optional torch.compile — fused kernels, removes Python overhead.
+    if args.use_compile and hasattr(torch, "compile"):
+        model = torch.compile(model, mode=args.compile_mode)
+
     diffusier = Interpolant(
-        args.prior_sampler, 
+        args.prior_sampler,
         total_count=torch.tensor([args.zinb_total_count]),
         logits=torch.tensor([args.zinb_logits]),
         zi_logits=args.zinb_zi_logits,
@@ -70,39 +82,55 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    # Mixed precision (bf16 is numerically safer for flow matching; no GradScaler needed).
+    amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "off": None}[args.amp]
+    amp_enabled = amp_dtype is not None and torch.cuda.is_available()
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype is torch.float16)
+
     print("Training")
     best_pearson, best_val_dict = -1, None
     early_stop_step = 0
     epoch_iter = tqdm(range(1, args.epochs + 1), ncols=100)
     for epoch in epoch_iter:
-        avg_loss = 0
+        # Accumulate loss on-device to avoid a GPU->CPU sync every step.
+        loss_sum = torch.zeros((), device=device)
+        n_steps = 0
         model.train()
 
         for step, batch in enumerate(train_loader):
-            batch = [x.to(device) for x in batch]
+            batch = [x.to(device, non_blocking=True) for x in batch]
             img_features, coords, gene_exp = batch
 
             noisy_exp, t_steps = diffusier.corrupt_exp(gene_exp)
-            pred_exp, loss = model(
-                exp=noisy_exp, 
-                img_features=img_features, 
-                coords=coords, 
-                labels=gene_exp, 
-                t_steps=t_steps
-            )
 
-            optimizer.zero_grad()
-            model.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
+                pred_exp, loss = model(
+                    exp=noisy_exp,
+                    img_features=img_features,
+                    coords=coords,
+                    labels=gene_exp,
+                    t_steps=t_steps,
+                )
 
-            if args.use_wandb:
-                wandb.log({f"{args.dataset}/Train/{split_id}/loss": loss.cpu().item()})
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
+                optimizer.step()
 
-            avg_loss += loss.cpu().item()
-        
-        avg_loss /= len(train_loader)
+            loss_sum = loss_sum + loss.detach()
+            n_steps += 1
+
+            if args.use_wandb and (step % args.log_every == 0):
+                wandb.log({f"{args.dataset}/Train/{split_id}/loss": loss.detach().float().item()})
+
+        avg_loss = (loss_sum / max(n_steps, 1)).item()
         epoch_iter.set_description(f"epoch: {epoch}, avg_loss: {avg_loss:.3f}")
 
         if args.save_step > 0 and epoch % args.save_step == 0:
@@ -195,7 +223,12 @@ if __name__ == '__main__':
     parser.add_argument('--clip_norm', type=float, default=1.)
     parser.add_argument('--save_step', type=int, default=-1)
     parser.add_argument('--eval_step', type=int, default=1)
-    parser.add_argument('--num_workers', type=int, default=1, help='Number of workers for dataloader')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for dataloader')
+    parser.add_argument('--prefetch_factor', type=int, default=4, help='DataLoader prefetch factor (only used when num_workers>0)')
+    parser.add_argument('--amp', type=str, default='off', choices=['off', 'bf16', 'fp16'], help='Mixed precision mode')
+    parser.add_argument('--use_compile', action='store_true', help='Enable torch.compile on the denoiser')
+    parser.add_argument('--compile_mode', type=str, default='default', help='torch.compile mode: default | reduce-overhead | max-autotune')
+    parser.add_argument('--log_every', type=int, default=10, help='wandb log every N steps (reduces GPU->CPU syncs)')
     parser.add_argument('--loss_func', type=str, default='mse', help="mse | mae | pearson")
     parser.add_argument('--patch_distribution', type=str, default='uniform')
     parser.add_argument('--n_genes', type=int, default=50)

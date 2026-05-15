@@ -186,43 +186,68 @@ class SpatialTransformer(nn.Module):
 
     def _build_graph(self, coords, batch_idx, n_neighbors, exclude_self=True):
         # coords: [N, 2], batch_idx: [N], n_neighbors: int
-        exclude_self_mask = torch.eye(coords.shape[0], dtype=torch.bool, device=coords.device)  # 1: diagonal elements
-        batch_mask = batch_idx.unsqueeze(0) == batch_idx.unsqueeze(1)  # [N, N], True if the token is in the same batch
+        with torch.no_grad():
+            # torch.cdist is materially cheaper than broadcast-norm for large N.
+            rel_dist = torch.cdist(coords, coords, p=2)  # [N, N]
 
-        # calculate relative distance
-        rel_pos = rearrange(coords, 'n d -> n 1 d') - rearrange(coords, 'n d -> 1 n d')
-        rel_dist = rel_pos.norm(dim = -1).detach()  # [N, N]
-        if exclude_self:
-            rel_dist.masked_fill_(exclude_self_mask | ~batch_mask, 1e9)
-        else:
-            rel_dist.masked_fill_(~batch_mask, 1e9)
+            batch_mask = batch_idx.unsqueeze(0) == batch_idx.unsqueeze(1)
+            if exclude_self:
+                exclude_self_mask = torch.eye(coords.shape[0], dtype=torch.bool, device=coords.device)
+                rel_dist.masked_fill_(exclude_self_mask | ~batch_mask, 1e9)
+            else:
+                rel_dist.masked_fill_(~batch_mask, 1e9)
 
-        dist_values, nearest_indices = rel_dist.topk(n_neighbors, dim = -1, largest = False)
+            _, nearest_indices = rel_dist.topk(n_neighbors, dim=-1, largest=False)
         return nearest_indices
 
-    def forward(self, gene_exp, features, coords):
+    def forward(self, gene_exp, features, coords, cached_graph=None):
         # gene_exp: [B, N_cells, N_genes], features: [B, N_cells, -1], coords: [B, N_cells, 2]
+        # cached_graph: optional dict produced by build_inference_cache(), reused across denoising steps
         B, N_cells, N_genes = gene_exp.shape[0], gene_exp.shape[1], gene_exp.shape[-1]
         device = features.device
-        
-        pad_mask = features.sum(dim=-1) == 0  # [B, N_cells], True if the token is padding
-        batch_idx = torch.arange(B, device=device).unsqueeze(-1).repeat(1, N_cells)[~pad_mask]
 
-        features = features[~pad_mask]  # [-1, 1024]
-        coords = coords[~pad_mask]  # [-1, 3]
-        gene_exp = gene_exp[~pad_mask]  # [-1, N_genes]
+        if cached_graph is None:
+            pad_mask = features.sum(dim=-1) == 0  # [B, N_cells], True if padding
+            batch_idx = torch.arange(B, device=device).unsqueeze(-1).repeat(1, N_cells)[~pad_mask]
 
-        nearest_indices = self._build_graph(
-            coords, batch_idx, min(self.n_neighbors, N_cells), exclude_self=True
-        )
+            features = features[~pad_mask]
+            coords = coords[~pad_mask]
+            gene_exp = gene_exp[~pad_mask]
 
-        # forward pass
+            nearest_indices = self._build_graph(
+                coords, batch_idx, min(self.n_neighbors, N_cells), exclude_self=True
+            )
+        else:
+            pad_mask = cached_graph["pad_mask"]
+            batch_idx = cached_graph["batch_idx"]
+            features = features[~pad_mask]
+            coords = cached_graph["coords"]
+            gene_exp = gene_exp[~pad_mask]
+            nearest_indices = cached_graph["nearest_indices"]
+
         all_gene_exp = []
         for blk in self.blks:
             gene_exp, features = blk(gene_exp, features, coords, nearest_indices)
             all_gene_exp.append(gene_exp)
-        gene_exp = torch.stack(all_gene_exp, dim=0).mean(dim=0)  # [B, N_cells, N_genes]
-        
-        # average the gene expression among the neighbors
-        gene_exp, _ = to_dense_batch(gene_exp, batch=batch_idx, fill_value=0, max_num_nodes=N_cells)  # [B, N_cells, N_genes]
+        gene_exp = torch.stack(all_gene_exp, dim=0).mean(dim=0)
+
+        gene_exp, _ = to_dense_batch(gene_exp, batch=batch_idx, fill_value=0, max_num_nodes=N_cells)
         return gene_exp
+
+    @torch.no_grad()
+    def build_inference_cache(self, features, coords):
+        """Precompute the KNN graph once per slide; reuse across all denoising steps."""
+        B, N_cells = features.shape[0], features.shape[1]
+        device = features.device
+        pad_mask = features.sum(dim=-1) == 0
+        batch_idx = torch.arange(B, device=device).unsqueeze(-1).repeat(1, N_cells)[~pad_mask]
+        flat_coords = coords[~pad_mask]
+        nearest_indices = self._build_graph(
+            flat_coords, batch_idx, min(self.n_neighbors, N_cells), exclude_self=True
+        )
+        return {
+            "pad_mask": pad_mask,
+            "batch_idx": batch_idx,
+            "coords": flat_coords,
+            "nearest_indices": nearest_indices,
+        }

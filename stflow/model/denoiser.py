@@ -73,7 +73,7 @@ class Denoiser(nn.Module):
         self.fourier_proj = TimestepEmbedder(config.hidden_dim)
         self.image_transform = nn.Linear(config.feature_dim, config.hidden_dim)
 
-    def inference(self, noisy_exp, img_features, coords, t_steps, predict=False):
+    def inference(self, noisy_exp, img_features, coords, t_steps, predict=False, cached_graph=None):
         # noisy_exp: [B, n_cells, n_genes]
         # img_features: [B, n_cells, n_features]
         # coords: [B, n_cells, 2]
@@ -86,7 +86,8 @@ class Denoiser(nn.Module):
         prediction = self.backbone(
             gene_exp=noisy_exp,
             features=features,
-            coords=coords
+            coords=coords,
+            cached_graph=cached_graph,
         )
         return prediction
 
@@ -95,3 +96,7 @@ class Denoiser(nn.Module):
         pad_mask = img_features.sum(-1) == 0
         loss = self.loss_func(prediction[~pad_mask], labels[~pad_mask])
         return prediction, loss
+
+    @torch.no_grad()
+    def build_inference_cache(self, img_features, coords):
+        return self.backbone.build_inference_cache(img_features, coords)

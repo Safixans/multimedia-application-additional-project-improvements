@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from scipy.spatial import KDTree
 from torch.utils.data import Dataset
 
 from stflow.hest_utils.st_dataset import load_adata
@@ -34,14 +35,23 @@ class SPData:
     labels: torch.Tensor | None = None
     coords: torch.Tensor | None = None
 
-    def __init__(self, features, labels, coords):
+    def __init__(self, features, labels, coords, _is_chunk=False):
         self.features = features
         self.labels = labels
         self.coords = coords
 
-        # decenter
-        self.coords[:, 0] = self.coords[:, 0] - self.coords[:, 0].mean()
-        self.coords[:, 1] = self.coords[:, 1] - self.coords[:, 1].mean()
+        if not _is_chunk:
+            # decenter only at construction of the full slide
+            self.coords[:, 0] = self.coords[:, 0] - self.coords[:, 0].mean()
+            self.coords[:, 1] = self.coords[:, 1] - self.coords[:, 1].mean()
+            # Build the KDTree once per slide (constant coords) — reused by every patch sample.
+            self._kdtree = KDTree(self.coords.numpy())
+        else:
+            self._kdtree = None
+
+    @property
+    def kdtree(self):
+        return self._kdtree
 
     def __len__(self):
         return len(self.features)
@@ -50,7 +60,8 @@ class SPData:
         return SPData(
             features=self.features[index],
             labels=self.labels[index],
-            coords=self.coords[index]
+            coords=self.coords[index],
+            _is_chunk=True,
         )
 
 
@@ -84,7 +95,9 @@ class HESTDataset(Dataset):
         return self.n_chunks
 
     def __getitem__(self, idx):
-        return self.sp_dataset.chunk(self.patch_sampler(self.sp_dataset.coords))
+        return self.sp_dataset.chunk(
+            self.patch_sampler(self.sp_dataset.coords, tree=self.sp_dataset.kdtree)
+        )
 
 
 class MultiHESTDataset(Dataset):
@@ -125,8 +138,8 @@ class MultiHESTDataset(Dataset):
         for i, n_chunk in enumerate(self.n_chunks):
             if idx < n_chunk:
                 return self.sp_datasets[i].chunk(
-                        self.patch_sampler(self.sp_datasets[i].coords)
-                    )
+                    self.patch_sampler(self.sp_datasets[i].coords, tree=self.sp_datasets[i].kdtree)
+                )
             idx -= n_chunk
 
 

@@ -55,19 +55,24 @@ def test(args, diffusier, model, loader_list, return_all=False):
         cur_pred, cur_gt = [], []
 
         for step, batch in enumerate(loader):
-            batch = [x.to(args.device) for x in batch]
+            batch = [x.to(args.device, non_blocking=True) for x in batch]
             img_features, coords, labels = batch
             assert img_features.shape[0] == 1, "Batch size must be 1 for inference"
 
-            exp_t1 = diffusier.sample_from_prior(labels.shape).to(args.device)
+            exp_t1 = diffusier.sample_from_prior(labels.shape)
             ts = torch.linspace(
-                0.01, 1.0, args.n_sample_steps
-            )[:, None].expand(args.n_sample_steps, exp_t1.shape[0]).to(args.device)
+                0.01, 1.0, args.n_sample_steps, device=args.device
+            )[:, None].expand(args.n_sample_steps, exp_t1.shape[0])
+
+            # Build KNN graph once per slide; reuse across every denoising step.
+            cached_graph = (model.module if hasattr(model, "module") else model).build_inference_cache(
+                img_features, coords
+            )
 
             for step, (t1, t2) in enumerate(zip(ts[:-1], ts[1:])):
                 pred = model.inference(
-                    exp_t1, img_features, coords, 
-                    t1, predict=True
+                    exp_t1, img_features, coords,
+                    t1, predict=True, cached_graph=cached_graph,
                 )
                 d_t = t2 - t1
 

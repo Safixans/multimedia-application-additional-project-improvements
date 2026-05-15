@@ -13,20 +13,22 @@ class Interpolant:
         self.normalize = normalize
     
     def sample_from_prior(self, shape):
-        exp = self.prior_sampler.sample(shape).to(self.device)
+        exp = self.prior_sampler.sample(shape)
+        if exp.device != torch.device(self.device):
+            exp = exp.to(self.device, non_blocking=True)
         if self.normalize:
             exp = torch.log(exp + 1)
         return exp
 
     def sample_t(self, shape):
-        return torch.rand(shape)
+        return torch.rand(shape, device=self.device)
 
     def corrupt_exp(self, exp):
         # exp: [B, n_cells, n_genes]
-        t = self.sample_t((exp.shape[0],)).to(self.device)
+        t = self.sample_t((exp.shape[0],))
         if exp.shape[0] > 1:
             t = t.squeeze(-1)
-        exp_0 = self.sample_from_prior(exp.shape).to(self.device)
+        exp_0 = self.sample_from_prior(exp.shape)
         return exp_0 * (1 - t[:, None, None]) + exp * t[:, None, None], t
 
     def denoise(self, exp_1, exp_t, t, d_t):
