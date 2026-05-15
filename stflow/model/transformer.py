@@ -18,24 +18,33 @@ def get_activation(activation="gelu"):
 
 class GeneUpdate(nn.Module):
     def __init__(
-            self, 
-            d_model, 
+            self,
+            d_model,
             n_genes,
             proj_drop=0.,
+            non_negative=False,
+            **kwargs,
         ):
-        super(GeneUpdate, self).__init__()    
+        # `non_negative` is accepted because TransformerBlock passes it.
+        # The upstream commit added the kwarg at the call site but not on this
+        # class, so instantiation fails without absorbing it. Default = False
+        # preserves the (broken) upstream behavior: no non-negative activation.
+        super(GeneUpdate, self).__init__()
 
-        self.output = nn.Sequential(
+        layers = [
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),
             nn.Dropout(proj_drop),
             nn.Linear(d_model, n_genes),
             nn.Dropout(proj_drop),
-        )
-    
+        ]
+        if non_negative:
+            layers.append(nn.Softplus())
+        self.output = nn.Sequential(*layers)
+
     def forward(self, features):
-        update = self.output(features) 
+        update = self.output(features)
         return update
 
 
